@@ -21,6 +21,8 @@ type Params struct {
 	Radius      int
 	UserName    string
 	Category    string
+	SearchTerm  string
+	Help        bool
 }
 
 type TextBlock struct {
@@ -99,13 +101,15 @@ func postToSlack(url string, blocks []Block) error {
 func buildBusinessBlocks(params *Params, businesses []Business) []Block {
 	log.Println("Building business blocks")
 
+	msg := fmt.Sprintf("*Ok @%s here's a Hi-5 for %s", params.UserName, params.Category)
+	if params.SearchTerm != "" {
+		msg = fmt.Sprintf("%s and %s", msg, params.SearchTerm)
+	}
+	msg = fmt.Sprintf("%s near %s*", msg, params.Location)
 	blocks := []Block{
 		Block{
 			Type: "section",
-			Text: &TextBlock{
-				"mrkdwn",
-				fmt.Sprintf("*Ok @%s, here are the results for %s near %s*", params.UserName, params.Category, params.Location),
-			},
+			Text: &TextBlock{"mrkdwn", msg},
 		},
 		Block{
 			Type: "divider",
@@ -166,6 +170,9 @@ func getYelpResults(params *Params) ([]Business, error) {
 	q.Add("categories", params.Category)
 	q.Add("limit", "5")
 	q.Add("sort_by", "rating")
+	if params.SearchTerm != "" {
+		q.Add("term", params.SearchTerm)
+	}
 	yelpReq.URL.RawQuery = q.Encode()
 
 	client := http.Client{}
@@ -185,6 +192,21 @@ func getYelpResults(params *Params) ([]Business, error) {
 	return data.Businesses, nil
 }
 
+func printHelp(w http.ResponseWriter) {
+	heading := "*Hi5 helps you find the top 5 rated businesses in a specified category and location.*\nYou can find the list of supported categories here: https://www.yelp.com/developers/documentation/v3/all_category_list"
+	usage := `Usage: /hi5 category=<category>&location=<city,state|zip>&[options]
+
+Options: key=value
+term:   additional search term to narrow your category results
+radius: radius in miles for the search area (maximum is 24)
+
+Example: Find top 5 rated pizza places in Los Angeles that serve beer
+/hi5 category=pizza&location=los angeles,ca&term=beer&radius=10
+`
+	msg := fmt.Sprintf("%s\n\n```\n%s\n```", heading, usage)
+	w.Write([]byte(msg))
+}
+
 func parseParams(params url.Values) (*Params, error) {
 	log.Println("Parsing params")
 
@@ -192,20 +214,20 @@ func parseParams(params url.Values) (*Params, error) {
 	responseURL := params.Get("response_url")
 	userName := params.Get("user_name")
 	text := strings.TrimSpace(params.Get("text"))
-	radiusMi := 5.0
 
-	parts := strings.Split(text, ",")
-	if len(parts) < 2 {
-		return nil, errors.New("Must provide at least category and location")
+	if strings.ToLower(text) == "help" {
+		return &Params{Help: true, Token: token}, nil
 	}
 
-	categoryRaw := strings.TrimSpace(parts[0])
-	category := strings.ToLower(strings.Join(strings.Split(categoryRaw, " "), ""))
-	location := strings.TrimSpace(parts[1])
+	q, err := url.ParseQuery(text)
+	if err != nil {
+		return nil, err
+	}
 
-	if len(parts) > 2 {
-		radRaw := strings.TrimSpace(parts[2])
-		rad, err := strconv.ParseFloat(radRaw, 64)
+	radiusMi := 5.0
+
+	if q.Get("radius") != "" {
+		rad, err := strconv.ParseFloat(q.Get("radius"), 64)
 		if err == nil {
 			radiusMi = rad
 		}
@@ -215,9 +237,25 @@ func parseParams(params url.Values) (*Params, error) {
 		return nil, errors.New("Maximum radius is 24 miles")
 	}
 
+	if q.Get("location") == "" {
+		return nil, errors.New("You must specify a location")
+	}
+
+	if q.Get("category") == "" {
+		return nil, errors.New("You must specify a category")
+	}
+
 	//convert miles to meters
 	radius := int(radiusMi / 0.00062137)
-	return &Params{token, responseURL, location, radius, userName, category}, nil
+	return &Params{
+		Token: token,
+		ResponseURL: responseURL,
+		UserName: userName,
+		Location: q.Get("location"),
+		Category: strings.ToLower(q.Get("category")),
+		SearchTerm: q.Get("term"),
+		Radius: radius,
+	}, nil
 }
 
 func Yelp(w http.ResponseWriter, r *http.Request) {
@@ -262,6 +300,11 @@ func Yelp(w http.ResponseWriter, r *http.Request) {
 
 	// Immediately let slack know we have a valid request
 	w.WriteHeader(http.StatusOK)
+
+	if params.Help {
+		printHelp(w)
+		return
+	}
 
 	businesses, err := getYelpResults(params)
 	if err != nil {
